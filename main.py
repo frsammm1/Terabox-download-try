@@ -20,9 +20,6 @@ app = Client("yt_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 if YT_COOKIES:
     with open("cookies.txt", "w") as f:
         f.write(YT_COOKIES)
-    print("✅ Cookies loaded")
-else:
-    print("⚠️ Warning: No Cookies")
 
 # --- WEB SERVER ---
 async def web_server():
@@ -35,7 +32,7 @@ async def web_server():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
-# --- Helpers ---
+# --- Helper Functions ---
 def humanbytes(size):
     if not size: return "0 B"
     power = 2**10
@@ -46,69 +43,99 @@ def humanbytes(size):
         n += 1
     return str(round(size, 2)) + " " + Dic_powerN[n] + 'B'
 
-def time_formatter(milliseconds: int) -> str:
-    seconds, milliseconds = divmod(int(milliseconds), 1000)
+def time_formatter(seconds: int) -> str:
     minutes, seconds = divmod(seconds, 60)
     hours, minutes = divmod(minutes, 60)
     return f"{minutes}m {seconds}s"
 
-async def progress_bar(current, total, message, start_time):
+# --- PROGRESS BAR GENERATOR ---
+def get_progress_text(current, total, speed, eta, status_type="Uploading"):
+    percentage = current * 100 / total
+    progress_str = "[{0}{1}] {2}%\n".format(
+        ''.join(["■" for i in range(math.floor(percentage / 10))]),
+        ''.join(["□" for i in range(10 - math.floor(percentage / 10))]),
+        round(percentage, 1))
+    
+    return f"🚀 **{status_type}...**\n" + progress_str + \
+           f"📁 {humanbytes(current)} / {humanbytes(total)}\n" + \
+           f"⚡ {humanbytes(speed)}/s | ⏱ ETA: {time_formatter(eta)}"
+
+# --- DOWNLOAD HOOK (For yt-dlp) ---
+# Ye function download karte waqt message edit karega
+async def download_hook(d, message, loop):
+    if d['status'] == 'downloading':
+        try:
+            total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+            downloaded = d.get('downloaded_bytes', 0)
+            speed = d.get('speed', 0) or 0
+            eta = d.get('eta', 0) or 0
+            
+            # Har 5 second me update karo taaki flood wait na aaye
+            now = time.time()
+            if not hasattr(message, 'last_update'):
+                message.last_update = 0
+            
+            if now - message.last_update > 5:
+                text = get_progress_text(downloaded, total, speed, eta, "Downloading")
+                # Asyncio run_coroutine_threadsafe use karna padega kyunki yt-dlp sync hai
+                asyncio.run_coroutine_threadsafe(message.edit_text(text), loop)
+                message.last_update = now
+        except:
+            pass
+
+# --- UPLOAD HOOK (For Pyrogram) ---
+async def upload_progress(current, total, message, start_time):
     now = time.time()
     diff = now - start_time
     if diff < 1 or total == 0: return
     
     if current % (total // 10) == 0 or current == total:
-        percentage = current * 100 / total
         speed = current / diff
-        time_to_completion = round((total - current) / speed) * 1000 if speed > 0 else 0
-        
-        progress = "[{0}{1}] {2}%\n".format(
-            ''.join(["■" for i in range(math.floor(percentage / 10))]),
-            ''.join(["□" for i in range(10 - math.floor(percentage / 10))]),
-            round(percentage, 1))
-        
-        tmp = progress + f"📁 {humanbytes(current)} / {humanbytes(total)}\n🚀 {humanbytes(speed)}/s\n⏱ ETA: {time_formatter(time_to_completion)}"
-        try: await message.edit_text(tmp)
+        eta = round((total - current) / speed)
+        text = get_progress_text(current, total, speed, eta, "Uploading")
+        try: await message.edit_text(text)
         except: pass
 
-# --- DOWNLOAD LOGIC (ANDROID MODE FIX) ---
+# --- MAIN LOGIC ---
 async def download_video(url, message):
-    status_msg = await message.reply_text("🔎 **Android Mode: Fetching...**")
+    status_msg = await message.reply_text("🔎 **Fetching Info...**")
     
     output_path = f"downloads/{message.id}.%(ext)s"
-    
-    # --- YAHAN HAI MAGIC FIX ---
+    loop = asyncio.get_event_loop()
+
+    # --- IOS MODE SETTINGS ---
     ydl_opts = {
         'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_path,
         'geo_bypass': True,
         'nocheckcertificate': True,
         'quiet': True,
-        'cookiefile': 'cookies.txt',
+        'cookiefile': 'cookies.txt', # Try with cookies first
         
-        # 1. Android Client Bano (IP restrictions kam hoti hain)
+        # iOS Client Spoofing (Better than Android for avoiding blocks)
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web'],
+                'player_client': ['ios', 'web'],
             }
         },
-        # 2. User Agent Spoofing (Taki lage mobile hai)
-        'user_agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36',
+        # Download Progress Hook
+        'progress_hooks': [lambda d: asyncio.ensure_future(download_hook(d, status_msg, loop))],
     }
 
     try:
+        # 1. Info & Download
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
             title = info.get('title', 'Video')
             duration = info.get('duration', 0)
             
-            await status_msg.edit_text(f"⬇️ **Downloading:** `{title}`")
+            await status_msg.edit_text(f"⬇️ **Starting Download:** `{title}`")
             
-            loop = asyncio.get_event_loop()
+            # Actual Download
             await loop.run_in_executor(None, lambda: ydl.download([url]))
             
+            # Filename Logic
             filename = f"downloads/{message.id}.mp4"
-            # Fallback finder
             if not os.path.exists(filename):
                  for file in os.listdir("downloads"):
                      if file.startswith(str(message.id)):
@@ -116,10 +143,11 @@ async def download_video(url, message):
                          break
             
             if not os.path.exists(filename):
-                await status_msg.edit_text("❌ Download Failed (File not generated).")
+                await status_msg.edit_text("❌ Download Failed.")
                 return
 
-            await status_msg.edit_text("🚀 **Uploading...**")
+            # 2. Upload
+            await status_msg.edit_text("🚀 **Uploading to Telegram...**")
             start_time = time.time()
             
             await client.send_video(
@@ -128,7 +156,7 @@ async def download_video(url, message):
                 caption=f"🎥 **{title}**",
                 duration=duration,
                 supports_streaming=True,
-                progress=progress_bar,
+                progress=upload_progress,
                 progress_args=(status_msg, start_time)
             )
             
@@ -136,15 +164,20 @@ async def download_video(url, message):
             os.remove(filename)
 
     except Exception as e:
-        await status_msg.edit_text(f"⚠️ **Error:** {e}")
-        # Error cleanup
+        error_text = str(e)
+        if "Sign in" in error_text or "403" in error_text:
+            await status_msg.edit_text("⚠️ **Block Error:** YouTube ne IP block kar di hai.\n\n**Try this:** Render se `YT_COOKIES` delete karke dobara try karo. Public videos bina cookies ke shayad chal jayein.")
+        else:
+            await status_msg.edit_text(f"⚠️ **Error:** {e}")
+        
+        # Cleanup
         if os.path.exists(f"downloads/{message.id}.mp4"):
             os.remove(f"downloads/{message.id}.mp4")
 
 # --- HANDLERS ---
 @app.on_message(filters.command("start"))
 async def start(client, message):
-    await message.reply_text("👋 **YouTube Downloader (Android Mode)**\nLink bhejo!")
+    await message.reply_text("👋 **YouTube Downloader (iOS Mode)**\nLink bhejo!")
 
 @app.on_message(filters.regex(r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?([a-zA-Z0-9_-]+)"))
 async def handle_yt(client, message):
@@ -159,4 +192,4 @@ if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.create_task(web_server())
     app.run()
-            
+        
