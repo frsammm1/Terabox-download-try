@@ -37,7 +37,7 @@ async def web_server():
 # --- Helper: Human Readable Size ---
 def humanbytes(size):
     if not size:
-        return "0 B"
+        return "Unknown Size"
     power = 2**10
     n = 0
     Dic_powerN = {0: ' ', 1: 'Ki', 2: 'Mi', 3: 'Gi', 4: 'Ti'}
@@ -53,14 +53,17 @@ async def progress_bar(current, total, message, start_time):
     
     if diff < 1: return 
 
+    # Agar Total size unknown hai (0), to crash mat hone do
+    if total == 0:
+        await message.edit_text(f"📥 Uploading... {humanbytes(current)}")
+        return
+
     if current % (total // 15) == 0 or current == total:
         percentage = current * 100 / total
         speed = current / diff
         elapsed_time = round(diff) * 1000
-        time_to_completion = round((total - current) / speed) * 1000
-        estimated_total_time = elapsed_time + time_to_completion
+        time_to_completion = round((total - current) / speed) * 1000 if speed > 0 else 0
         
-        # Time Formatting
         def time_fmt(ms):
             s, ms = divmod(int(ms), 1000)
             m, s = divmod(s, 60)
@@ -100,9 +103,9 @@ class URLFile(io.BytesIO):
         if self.start_byte > 0:
             req_headers['Range'] = f'bytes={self.start_byte}-'
         
-        # SSL False kiya hai taaki connection error na aaye
         timeout = aiohttp.ClientTimeout(total=None, connect=60)
-        self.response = await self.session.get(self.url, headers=req_headers, timeout=timeout, ssl=False)
+        # SSL False aur allow_redirects True rakha hai
+        self.response = await self.session.get(self.url, headers=req_headers, timeout=timeout, ssl=False, allow_redirects=True)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -119,6 +122,8 @@ class URLFile(io.BytesIO):
         return b""
 
     def __len__(self):
+        if self.total_size == 0:
+            return 0 # Handle unknown size gracefully
         remaining = self.total_size - self.start_byte
         return min(remaining, TG_SPLIT_LIMIT)
 
@@ -166,7 +171,7 @@ async def get_direct_link(terabox_url):
     except Exception as e:
         return None, f"Exception: {e}"
 
-# --- PROCESSOR ---
+# --- PROCESSOR (THE FIX IS HERE) ---
 async def process_single_link(client, message, terabox_url):
     status_msg = await message.reply_text(f"⏳ **Processing...**\n`{terabox_url}`")
     
@@ -177,15 +182,17 @@ async def process_single_link(client, message, terabox_url):
             await status_msg.edit_text(f"❌ **Error:** {error_msg}")
             return
 
-        # --- HEADERS MAGIC (FIX FOR 0B ERROR) ---
-        # Referer add karna jaruri hai varna Terabox reject kar deta hai
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
             'Cookie': TERABOX_COOKIE,
             'Referer': 'https://www.terabox.com/' 
         }
 
-        # SSL Verify False kiya hai (FIX FOR CONNECTION ERROR)
+        # Step 1: Try to get Size via HEAD, but DON'T Fail if it returns 0
+        total_size = 0
+        filename = "video.mp4"
+        file_category = "VIDEO"
+
         connector = aiohttp.TCPConnector(ssl=False)
         async with aiohttp.ClientSession(connector=connector) as session:
             try:
@@ -193,12 +200,6 @@ async def process_single_link(client, message, terabox_url):
                     total_size = int(head_resp.headers.get('Content-Length', 0))
                     content_type = head_resp.headers.get('Content-Type', '')
                     
-                    # Agar HEAD request me size 0 aaya, to GET request try karo
-                    if total_size == 0:
-                        # Sometimes HEAD fails on Terabox, GET works
-                        pass 
-
-                    filename = "video.mp4"
                     cd = head_resp.headers.get("Content-Disposition")
                     if cd and "filename=" in cd:
                         filename = cd.split("filename=")[1].strip('"')
@@ -206,21 +207,18 @@ async def process_single_link(client, message, terabox_url):
                     file_category = get_file_type(content_type, filename)
                     if file_category == "VIDEO" and not filename.lower().endswith(".mp4"):
                         filename = os.path.splitext(filename)[0] + ".mp4"
+            except:
+                pass # HEAD fail hua to ignore karo, aage download me dekh lenge
 
-            except Exception as e:
-                # Agar HEAD request fail hua, tab bhi hum download try karenge
-                print(f"HEAD Failed: {e}")
-                total_size = 100 * 1024 * 1024 # Fake size assume kar lo start karne ke liye
-                filename = "video.mp4"
-                file_category = "VIDEO"
-
-            if total_size > TG_SPLIT_LIMIT:
+            # Agar HEAD request ne 0 size diya, tab bhi hum error nahi denge
+            if total_size == 0:
+                await status_msg.edit_text(f"⚠️ Size Detect Nahi Hua (0 B)...\n🚀 **Starting Force Download...**")
+            elif total_size > TG_SPLIT_LIMIT:
                 await status_msg.edit_text(f"⚠️ **File Too Big**\nSize: {humanbytes(total_size)}\nSending first 2GB only...")
             else:
-                await status_msg.edit_text(f"🚀 **Starting Download...**\n**File:** {filename}\n**Size:** {humanbytes(total_size)}")
+                await status_msg.edit_text(f"🚀 **Download Started**\n**File:** {filename}\n**Size:** {humanbytes(total_size)}")
             
             start_time = time.time()
-            # Yaha bhi session pass kar rahe hain jisme SSL disabled hai
             async with URLFile(session, direct_url, total_size, filename, headers) as stream_file:
                 if file_category == "VIDEO":
                     await client.send_video(
@@ -245,7 +243,7 @@ async def process_single_link(client, message, terabox_url):
             await status_msg.delete()
 
     except Exception as e:
-        await status_msg.edit_text(f"⚠️ **Critical Error:** {e}")
+        await status_msg.edit_text(f"⚠️ **Failed:** {e}")
 
 # --- HANDLERS ---
 @app.on_message(filters.command("start"))
@@ -271,4 +269,3 @@ if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.create_task(web_server())
     app.run()
-        
