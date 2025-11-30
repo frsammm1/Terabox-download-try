@@ -238,25 +238,35 @@ async def download_file_optimized(url, filepath, cookie, status_msg, uid):
     
     async with aiohttp.ClientSession(
         timeout=timeout, 
-        connector=connector,
-        max_redirects=10  # CRITICAL: Handle redirects (fixes 302 error)
+        connector=connector
     ) as session:
         
         while retry_count > 0:
             try:
-                # Step 1: Get final URL after redirects
-                async with session.head(url, headers=headers, allow_redirects=True) as response:
-                    final_url = str(response.url)  # Get final URL after redirects
+                await status_msg.edit_text(
+                    f"🔍 **Checking file...**\n"
+                    f"**Attempt:** {4-retry_count}/3\n\n"
+                    f"⏳ Resolving redirects..."
+                )
+                
+                # Step 1: Get file size and handle redirects
+                async with session.get(url, headers=headers, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                    # Check status
+                    if response.status not in (200, 206):
+                        raise Exception(f"HTTP {response.status} - Server error")
+                    
+                    # Get final URL and size
+                    final_url = str(response.url)
                     total_size = int(response.headers.get('Content-Length', 0))
                     
-                    if response.status not in (200, 302):
-                        raise Exception(f"HTTP {response.status} - Server rejected request")
-                    
                     if total_size == 0:
-                        raise Exception("Content-Length is 0 - Terabox blocked request")
+                        raise Exception("File size is 0 - Invalid link or blocked")
                     
                     if total_size > MAX_FILE_SIZE:
                         raise Exception(f"File too large: {humanbytes(total_size)} (Max: 2GB)")
+                    
+                    # Close this connection, we'll download fresh
+                    pass
                 
                 # Initial status
                 await status_msg.edit_text(
@@ -556,6 +566,4 @@ if __name__ == "__main__":
     print("🚀 Terabox Downloader - OPTIMIZED Started!")
     print(f"📁 Download directory: {DOWNLOAD_DIR.absolute()}")
     print(f"💾 Max file size: {humanbytes(MAX_FILE_SIZE)}")
-    print(f"⚡ Chunk size: {humanbytes(CHUNK_SIZE)}")
-    print(f"📦 Buffer size: {humanbytes(BUFFER_SIZE)}")
-    app.run()
+    print(f"⚡ Chunk 
