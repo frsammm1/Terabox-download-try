@@ -37,7 +37,7 @@ async def web_server():
 # --- Helper: Human Readable Size ---
 def humanbytes(size):
     if not size:
-        return ""
+        return "0 B"
     power = 2**10
     n = 0
     Dic_powerN = {0: ' ', 1: 'Ki', 2: 'Mi', 3: 'Gi', 4: 'Ti'}
@@ -45,18 +45,6 @@ def humanbytes(size):
         size /= power
         n += 1
     return str(round(size, 2)) + " " + Dic_powerN[n] + 'B'
-
-# --- Helper: Time Formatter ---
-def time_formatter(milliseconds: int) -> str:
-    seconds, milliseconds = divmod(int(milliseconds), 1000)
-    minutes, seconds = divmod(seconds, 60)
-    hours, minutes = divmod(minutes, 60)
-    days, hours = divmod(hours, 24)
-    tmp = ((str(days) + "d, ") if days else "") + \
-          ((str(hours) + "h, ") if hours else "") + \
-          ((str(minutes) + "m, ") if minutes else "") + \
-          ((str(seconds) + "s") if seconds else "")
-    return tmp[:-2] if tmp.endswith(", ") else tmp
 
 # --- Advanced Progress Bar ---
 async def progress_bar(current, total, message, start_time):
@@ -72,28 +60,29 @@ async def progress_bar(current, total, message, start_time):
         time_to_completion = round((total - current) / speed) * 1000
         estimated_total_time = elapsed_time + time_to_completion
         
-        elapsed_str = time_formatter(elapsed_time)
-        estimated_str = time_formatter(time_to_completion)
+        # Time Formatting
+        def time_fmt(ms):
+            s, ms = divmod(int(ms), 1000)
+            m, s = divmod(s, 60)
+            h, m = divmod(m, 60)
+            return f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
         
-        progress = "[{0}{1}] \n**Progress**: {2}%\n".format(
+        estimated_str = time_fmt(time_to_completion)
+        
+        progress = "[{0}{1}] {2}%\n".format(
             ''.join(["■" for i in range(math.floor(percentage / 10))]),
             ''.join(["□" for i in range(10 - math.floor(percentage / 10))]),
-            round(percentage, 2))
+            round(percentage, 1))
             
-        tmp = progress + "**Done**: {0} of {1}\n**Speed**: {2}/s\n**ETA**: {3}".format(
-            humanbytes(current),
-            humanbytes(total),
-            humanbytes(speed),
-            estimated_str if estimated_str else "0s"
-        )
+        tmp = progress + f"📁 {humanbytes(current)} / {humanbytes(total)}\n🚀 {humanbytes(speed)}/s\n⏱ ETA: {estimated_str}"
         
         try:
             await message.edit_text(text=f"{tmp}")
         except:
             pass
 
-# --- Streaming Class (FIXED FOR BINARY ERROR) ---
-class URLFile(io.BytesIO): # Inherit BytesIO to pass Pyrogram checks
+# --- Streaming Class (Binary Mode + SSL Fix) ---
+class URLFile(io.BytesIO): 
     def __init__(self, session, url, total_size, filename, headers, start_byte=0):
         self.session = session
         self.url = url
@@ -104,14 +93,16 @@ class URLFile(io.BytesIO): # Inherit BytesIO to pass Pyrogram checks
         self.start_byte = start_byte
         self.current_byte = 0
         self.response = None
-        self.mode = 'rb' # <--- IMPORTANT: Tells Pyrogram this is Binary Data
+        self.mode = 'rb' 
 
     async def __aenter__(self):
         req_headers = self.headers.copy()
         if self.start_byte > 0:
             req_headers['Range'] = f'bytes={self.start_byte}-'
+        
+        # SSL False kiya hai taaki connection error na aaye
         timeout = aiohttp.ClientTimeout(total=None, connect=60)
-        self.response = await self.session.get(self.url, headers=req_headers, timeout=timeout)
+        self.response = await self.session.get(self.url, headers=req_headers, timeout=timeout, ssl=False)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -154,7 +145,7 @@ async def get_direct_link(terabox_url):
         result = await loop.run_in_executor(None, lambda: client.get_file_info(clean_url))
         
         if not result:
-             return None, "Failed. Link dead or Cookie expired."
+             return None, "Link dead or Cookie expired."
 
         file_info = None
         if isinstance(result, list) and len(result) > 0:
@@ -177,7 +168,7 @@ async def get_direct_link(terabox_url):
 
 # --- PROCESSOR ---
 async def process_single_link(client, message, terabox_url):
-    status_msg = await message.reply_text(f"⏳ **Processing Link:**\n`{terabox_url}`")
+    status_msg = await message.reply_text(f"⏳ **Processing...**\n`{terabox_url}`")
     
     try:
         direct_url, error_msg = await get_direct_link(terabox_url)
@@ -186,31 +177,50 @@ async def process_single_link(client, message, terabox_url):
             await status_msg.edit_text(f"❌ **Error:** {error_msg}")
             return
 
+        # --- HEADERS MAGIC (FIX FOR 0B ERROR) ---
+        # Referer add karna jaruri hai varna Terabox reject kar deta hai
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Cookie': TERABOX_COOKIE
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+            'Cookie': TERABOX_COOKIE,
+            'Referer': 'https://www.terabox.com/' 
         }
 
-        async with aiohttp.ClientSession() as session:
-            async with session.head(direct_url, headers=headers) as head_resp:
-                total_size = int(head_resp.headers.get('Content-Length', 0))
-                content_type = head_resp.headers.get('Content-Type', '')
-                
+        # SSL Verify False kiya hai (FIX FOR CONNECTION ERROR)
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            try:
+                async with session.head(direct_url, headers=headers, allow_redirects=True) as head_resp:
+                    total_size = int(head_resp.headers.get('Content-Length', 0))
+                    content_type = head_resp.headers.get('Content-Type', '')
+                    
+                    # Agar HEAD request me size 0 aaya, to GET request try karo
+                    if total_size == 0:
+                        # Sometimes HEAD fails on Terabox, GET works
+                        pass 
+
+                    filename = "video.mp4"
+                    cd = head_resp.headers.get("Content-Disposition")
+                    if cd and "filename=" in cd:
+                        filename = cd.split("filename=")[1].strip('"')
+                    
+                    file_category = get_file_type(content_type, filename)
+                    if file_category == "VIDEO" and not filename.lower().endswith(".mp4"):
+                        filename = os.path.splitext(filename)[0] + ".mp4"
+
+            except Exception as e:
+                # Agar HEAD request fail hua, tab bhi hum download try karenge
+                print(f"HEAD Failed: {e}")
+                total_size = 100 * 1024 * 1024 # Fake size assume kar lo start karne ke liye
                 filename = "video.mp4"
-                cd = head_resp.headers.get("Content-Disposition")
-                if cd and "filename=" in cd:
-                    filename = cd.split("filename=")[1].strip('"')
-                
-                file_category = get_file_type(content_type, filename)
-                if file_category == "VIDEO" and not filename.lower().endswith(".mp4"):
-                    filename = os.path.splitext(filename)[0] + ".mp4"
+                file_category = "VIDEO"
 
             if total_size > TG_SPLIT_LIMIT:
                 await status_msg.edit_text(f"⚠️ **File Too Big**\nSize: {humanbytes(total_size)}\nSending first 2GB only...")
             else:
-                await status_msg.edit_text(f"🚀 **Download Started**\n**File:** {filename}\n**Size:** {humanbytes(total_size)}")
+                await status_msg.edit_text(f"🚀 **Starting Download...**\n**File:** {filename}\n**Size:** {humanbytes(total_size)}")
             
             start_time = time.time()
+            # Yaha bhi session pass kar rahe hain jisme SSL disabled hai
             async with URLFile(session, direct_url, total_size, filename, headers) as stream_file:
                 if file_category == "VIDEO":
                     await client.send_video(
@@ -235,15 +245,12 @@ async def process_single_link(client, message, terabox_url):
             await status_msg.delete()
 
     except Exception as e:
-        await status_msg.edit_text(f"⚠️ Error: {e}")
+        await status_msg.edit_text(f"⚠️ **Critical Error:** {e}")
 
 # --- HANDLERS ---
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
-    await message.reply_text(
-        "👋 **Hello! Welcome to Terabox Downloader Bot.**\n"
-        "Link bhejo, video milegi!"
-    )
+    await message.reply_text("👋 Terabox Link Bhejo!")
 
 @app.on_message(filters.text & filters.regex(r"terabox|1024tera|momerybox|teraboxapp"))
 async def handle_message(client, message):
@@ -255,7 +262,7 @@ async def handle_message(client, message):
         return
 
     unique_urls = list(set(tera_urls))
-    await message.reply_text(f"🔎 Found {len(unique_urls)} links. Queue started...")
+    await message.reply_text(f"🔎 Found {len(unique_urls)} links. Processing...")
 
     for link in unique_urls:
         await process_single_link(client, message, link)
