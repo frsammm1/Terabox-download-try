@@ -19,6 +19,10 @@ PORT = int(os.environ.get("PORT", 8080))
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
+# Memory management
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB limit
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks for better memory handling
+
 app = Client("terabox_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 stop_dict = {}
 
@@ -43,198 +47,300 @@ def humanbytes(size):
         n += 1
     return f"{round(size, 2)} {units[n]}B"
 
-async def progress_bar(current, total, msg, start, uid):
+def time_formatter(seconds):
+    """Convert seconds to human readable format"""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        minutes = int(seconds / 60)
+        secs = int(seconds % 60)
+        return f"{minutes}m {secs}s"
+    else:
+        hours = int(seconds / 3600)
+        minutes = int((seconds % 3600) / 60)
+        return f"{hours}h {minutes}m"
+
+async def download_progress(current, total, msg, start, uid, phase="Downloading"):
+    """Progress bar for download phase"""
     if stop_dict.get(uid, False):
         raise Exception("Cancelled")
-        
+    
     now = time.time()
     diff = now - start
-    if diff < 2 or total == 0: 
+    
+    # Update every 1.5 seconds
+    if diff < 1.5:
         return
     
-    percent = (current * 100) / total
-    speed = current / diff
-    eta = round((total - current) / speed) if speed > 0 else 0
+    percent = (current * 100) / total if total > 0 else 0
+    speed = current / diff if diff > 0 else 0
+    eta = int((total - current) / speed) if speed > 0 else 0
     
-    bar_len = math.floor(percent / 5)
-    bar = '█' * bar_len + '░' * (20 - bar_len)
+    # Progress bar
+    filled = int(percent / 5)
+    bar = '█' * filled + '░' * (20 - filled)
     
-    text = f"**{round(percent, 1)}%**\n[{bar}]\n\n"
-    text += f"📦 {humanbytes(current)} / {humanbytes(total)}\n"
-    text += f"⚡ {humanbytes(speed)}/s | ⏱ {eta}s left"
+    status = f"**{phase}:** `{round(percent, 1)}%`\n"
+    status += f"[{bar}]\n\n"
+    status += f"**Downloaded:** {humanbytes(current)} / {humanbytes(total)}\n"
+    status += f"**Speed:** {humanbytes(speed)}/s\n"
+    status += f"**ETA:** {time_formatter(eta)}\n"
+    status += f"**Elapsed:** {time_formatter(diff)}\n\n"
+    status += "💡 /stop to cancel"
     
     try:
-        await msg.edit_text(text)
+        await msg.edit_text(status)
     except:
         pass
 
-# --- DOWNLOAD FILE ---
+async def upload_progress(current, total, msg, start, uid):
+    """Progress bar for upload phase"""
+    if stop_dict.get(uid, False):
+        raise Exception("Cancelled")
+    
+    now = time.time()
+    diff = now - start
+    
+    if diff < 1.5:
+        return
+    
+    percent = (current * 100) / total if total > 0 else 0
+    speed = current / diff if diff > 0 else 0
+    eta = int((total - current) / speed) if speed > 0 else 0
+    
+    filled = int(percent / 5)
+    bar = '█' * filled + '░' * (20 - filled)
+    
+    status = f"**Uploading to Telegram:** `{round(percent, 1)}%`\n"
+    status += f"[{bar}]\n\n"
+    status += f"**Uploaded:** {humanbytes(current)} / {humanbytes(total)}\n"
+    status += f"**Speed:** {humanbytes(speed)}/s\n"
+    status += f"**ETA:** {time_formatter(eta)}\n"
+    status += f"**Elapsed:** {time_formatter(diff)}\n\n"
+    status += "💡 /stop to cancel"
+    
+    try:
+        await msg.edit_text(status)
+    except:
+        pass
+
 async def download_file(url, filepath, cookie, status_msg, uid):
-    """Download file to disk first"""
+    """Optimized download with chunked streaming"""
     
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0',
         'Cookie': cookie,
         'Referer': 'https://www.terabox.com/',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'keep-alive'
     }
     
-    timeout = aiohttp.ClientTimeout(total=None, connect=30, sock_read=60)
-    connector = aiohttp.TCPConnector(ssl=False, limit=10)
+    # Aggressive timeout for large files
+    timeout = aiohttp.ClientTimeout(
+        total=None,  # No total timeout
+        connect=30,
+        sock_read=120  # 2 minutes read timeout
+    )
+    
+    connector = aiohttp.TCPConnector(
+        ssl=False,
+        limit=5,
+        force_close=False,  # Keep connection alive
+        enable_cleanup_closed=True
+    )
+    
+    downloaded = 0
+    start_time = time.time()
+    last_update = start_time
     
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         async with session.get(url, headers=headers) as response:
             
             if response.status != 200:
-                raise Exception(f"HTTP {response.status}")
+                raise Exception(f"HTTP {response.status} - Server rejected request")
             
             total_size = int(response.headers.get('Content-Length', 0))
             
             if total_size == 0:
-                raise Exception("Content-Length is 0 - Server blocked request")
+                raise Exception("Content-Length is 0 - Terabox blocked the IP/request")
             
-            downloaded = 0
-            start_time = time.time()
+            if total_size > MAX_FILE_SIZE:
+                raise Exception(f"File too large: {humanbytes(total_size)} (Max: 2GB)")
             
+            # Initial status
+            await status_msg.edit_text(
+                f"📥 **Starting download...**\n\n"
+                f"**Size:** {humanbytes(total_size)}\n"
+                f"**File:** `{filepath.name}`"
+            )
+            
+            # Download with chunked writing
             with open(filepath, 'wb') as f:
-                async for chunk in response.content.iter_chunked(524288):  # 512KB chunks
+                async for chunk in response.content.iter_chunked(CHUNK_SIZE):
                     
                     if stop_dict.get(uid, False):
-                        raise Exception("Cancelled by user")
+                        raise Exception("Download cancelled by user")
                     
                     f.write(chunk)
                     downloaded += len(chunk)
                     
-                    # Update progress every 2%
-                    if downloaded % (total_size // 50) == 0 or downloaded == total_size:
-                        now = time.time()
-                        diff = now - start_time
-                        
-                        if diff > 2:
-                            percent = (downloaded * 100) / total_size
-                            speed = downloaded / diff
-                            eta = round((total_size - downloaded) / speed) if speed > 0 else 0
-                            
-                            bar_len = math.floor(percent / 5)
-                            bar = '█' * bar_len + '░' * (20 - bar_len)
-                            
-                            text = f"**Downloading: {round(percent, 1)}%**\n[{bar}]\n\n"
-                            text += f"📥 {humanbytes(downloaded)} / {humanbytes(total_size)}\n"
-                            text += f"⚡ {humanbytes(speed)}/s | ⏱ {eta}s"
-                            
-                            try:
-                                await status_msg.edit_text(text)
-                            except:
-                                pass
+                    # Update progress every 1.5 seconds OR every 10MB
+                    now = time.time()
+                    if (now - last_update >= 1.5) or (downloaded % (10 * 1024 * 1024) < CHUNK_SIZE):
+                        await download_progress(downloaded, total_size, status_msg, start_time, uid, "📥 Downloading")
+                        last_update = now
+            
+            # Final progress
+            await download_progress(downloaded, total_size, status_msg, start_time, uid, "📥 Download Complete")
             
             return total_size
 
-# --- GET DIRECT LINK ---
 async def get_direct_link(url):
+    """Extract direct download link from Terabox"""
     try:
+        # Normalize URL
         clean = re.sub(r"https?://[a-zA-Z0-9.-]+", "https://www.terabox.com", url)
         
         dl = TeraboxDL(TERABOX_COOKIE)
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, lambda: dl.get_file_info(clean))
+        
+        # Run in executor to avoid blocking
+        result = await loop.run_in_executor(
+            None,
+            lambda: dl.get_file_info(clean)
+        )
         
         if not result:
-            return None, None
+            return None, None, None
         
         info = result[0] if isinstance(result, list) else result
-        link = info.get('dlink') or info.get('download_link') or info.get('url')
-        name = info.get('server_filename', 'video.mp4')
         
-        return link, name
+        link = info.get('dlink') or info.get('download_link') or info.get('url')
+        filename = info.get('server_filename', 'video.mp4')
+        filesize = info.get('size', 0)
+        
+        return link, filename, filesize
         
     except Exception as e:
-        return None, None
+        return None, None, None
 
-# --- MAIN PROCESS ---
 async def process_link(client: Client, message: Message, url: str):
+    """Main processing pipeline"""
+    
     uid = message.from_user.id
     stop_dict[uid] = False
-    
-    status = await message.reply_text("🔍 **Step 1/4:** Extracting link...")
     filepath = None
+    
+    status = await message.reply_text(
+        "🔍 **Step 1/4:** Extracting download link...\n\n"
+        "⏳ Please wait..."
+    )
     
     try:
         # Step 1: Extract direct link
-        direct, filename = await get_direct_link(url)
+        direct, filename, filesize = await get_direct_link(url)
         
         if not direct:
             await status.edit_text(
-                "❌ **Step 1 Failed: Link extraction**\n\n"
-                "**Reasons:**\n"
+                "❌ **Step 1 Failed!**\n\n"
+                "**Could not extract download link**\n\n"
+                "**Possible reasons:**\n"
                 "• Invalid/expired Terabox URL\n"
-                "• TERABOX_COOKIE is wrong/expired\n"
-                "• File is private or deleted\n\n"
-                "**Fix:** Update cookie in environment variables"
+                "• TERABOX_COOKIE expired or wrong\n"
+                "• File is private or deleted\n"
+                "• Terabox API changed\n\n"
+                "**Fix:** Update TERABOX_COOKIE in environment"
             )
             return
         
+        size_text = humanbytes(filesize) if filesize > 0 else "Unknown"
+        
         await status.edit_text(
-            f"✅ **Step 1:** Link extracted\n"
-            f"📄 `{filename}`\n\n"
+            f"✅ **Step 1:** Link extracted!\n\n"
+            f"**📄 File:** `{filename}`\n"
+            f"**📦 Size:** {size_text}\n\n"
             f"📥 **Step 2/4:** Downloading to server..."
         )
         
-        # Step 2: Download file to disk
+        # Step 2: Download file
         filepath = DOWNLOAD_DIR / f"{uid}_{int(time.time())}_{filename}"
         
         try:
-            file_size = await download_file(direct, filepath, TERABOX_COOKIE, status, uid)
+            downloaded_size = await download_file(direct, filepath, TERABOX_COOKIE, status, uid)
             
             await status.edit_text(
-                f"✅ **Step 2:** Downloaded {humanbytes(file_size)}\n\n"
-                f"📤 **Step 3/4:** Uploading to Telegram..."
+                f"✅ **Step 2:** Downloaded {humanbytes(downloaded_size)}\n\n"
+                f"📤 **Step 3/4:** Uploading to Telegram...\n\n"
+                f"⏳ Starting upload..."
             )
             
         except Exception as dl_err:
+            error_text = str(dl_err)
+            
             await status.edit_text(
-                f"❌ **Step 2 Failed: Download**\n\n"
-                f"**Error:** `{str(dl_err)[:300]}`\n\n"
-                f"**Reasons:**\n"
-                f"• Render IP blocked by Terabox\n"
+                f"❌ **Step 2 Failed!**\n\n"
+                f"**Download error:** `{error_text[:250]}`\n\n"
+                f"**Common reasons:**\n"
+                f"• Terabox blocked Render's IP\n"
                 f"• Connection timeout\n"
-                f"• File too large for free tier\n\n"
-                f"**Note:** Render free tier has limited bandwidth & IPs often blocked"
+                f"• File too large for bandwidth\n"
+                f"• Network instability\n\n"
+                f"**Note:** Free tier has limited resources"
             )
             return
         
         # Step 3: Upload to Telegram
-        start_upload = time.time()
+        upload_start = time.time()
+        
+        # Check file exists and has content
+        if not filepath.exists() or filepath.stat().st_size == 0:
+            await status.edit_text("❌ **Downloaded file is empty or missing!**")
+            return
         
         try:
-            # Try as video first
+            # Try as video first (better for media files)
             await client.send_video(
                 chat_id=message.chat.id,
                 video=str(filepath),
-                caption=f"🎬 {filename}\n\n📦 Size: {humanbytes(file_size)}",
+                caption=f"🎬 **{filename}**\n\n📦 Size: {humanbytes(downloaded_size)}\n⚡ Downloaded from Terabox",
                 supports_streaming=True,
-                progress=progress_bar,
-                progress_args=(status, start_upload, uid)
+                progress=upload_progress,
+                progress_args=(status, upload_start, uid)
             )
             
-        except Exception:
-            # Fallback to document
-            await status.edit_text("⚠️ Video upload failed, trying as document...")
+        except Exception as vid_err:
+            # Fallback: Send as document
+            await status.edit_text(
+                "⚠️ Video upload failed, sending as document...\n\n"
+                "This is normal for non-video files."
+            )
             
             await client.send_document(
                 chat_id=message.chat.id,
                 document=str(filepath),
-                caption=f"📁 {filename}\n\n📦 Size: {humanbytes(file_size)}",
-                progress=progress_bar,
-                progress_args=(status, start_upload, uid)
+                caption=f"📁 **{filename}**\n\n📦 Size: {humanbytes(downloaded_size)}",
+                progress=upload_progress,
+                progress_args=(status, upload_start, uid)
             )
         
         # Step 4: Cleanup
-        await status.edit_text("🧹 **Step 4/4:** Cleaning up...")
+        await status.edit_text("🧹 **Step 4/4:** Cleaning up server storage...")
         
         if filepath and filepath.exists():
             filepath.unlink()
-        
+            
+        await asyncio.sleep(1)
         await status.delete()
-        await message.reply_text("✅ **Complete!** 🎉")
+        
+        # Success message
+        total_time = time.time() - upload_start
+        await message.reply_text(
+            f"✅ **Upload Complete!** 🎉\n\n"
+            f"**File:** {filename}\n"
+            f"**Size:** {humanbytes(downloaded_size)}\n"
+            f"**Time:** {time_formatter(total_time)}"
+        )
         
     except Exception as e:
         error = str(e)
@@ -243,13 +349,15 @@ async def process_link(client: Client, message: Message, url: str):
             await status.edit_text("🛑 **Cancelled by user**")
         else:
             await status.edit_text(
-                f"❌ **Unexpected error**\n\n"
-                f"```python\n{error[:400]}```"
+                f"❌ **Unexpected Error**\n\n"
+                f"```\n{error[:350]}\n```\n\n"
+                f"Try again or contact support."
             )
     
     finally:
         # Always cleanup
         stop_dict[uid] = False
+        
         if filepath and filepath.exists():
             try:
                 filepath.unlink()
@@ -260,29 +368,39 @@ async def process_link(client: Client, message: Message, url: str):
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message):
     await message.reply_text(
-        "🚀 **Terabox Downloader**\n\n"
-        "**Method:** Download → Upload\n"
-        "**Why:** Pyrogram doesn't accept custom async streams\n\n"
-        "**Process:**\n"
-        "1️⃣ Extract direct link from Terabox\n"
-        "2️⃣ Download file to Render server\n"
-        "3️⃣ Upload to Telegram\n"
-        "4️⃣ Delete from server\n\n"
-        "**Limitations:**\n"
-        "• Free tier: Limited storage & bandwidth\n"
-        "• Terabox often blocks Render IPs\n"
-        "• Large files may fail\n\n"
-        "Send a Terabox link to start!"
+        "🚀 **Terabox Downloader Pro**\n\n"
+        "**✨ Features:**\n"
+        "• Download files up to 2GB\n"
+        "• Real-time progress tracking\n"
+        "• Speed & ETA display\n"
+        "• Auto cleanup after upload\n\n"
+        "**📥 How to use:**\n"
+        "1. Send any Terabox link\n"
+        "2. Bot downloads to server\n"
+        "3. Bot uploads to Telegram\n"
+        "4. File sent to you!\n\n"
+        "**⚠️ Limitations:**\n"
+        "• Free tier: 512MB RAM, limited bandwidth\n"
+        "• Some IPs blocked by Terabox\n"
+        "• Large files may take time\n\n"
+        "**Commands:**\n"
+        "/start - Show this info\n"
+        "/stop - Cancel active download\n\n"
+        "**Supported:** terabox.com, 1024tera.com, momerybox.com, teraboxapp.com"
     )
 
 @app.on_message(filters.command("stop"))
 async def stop_cmd(client, message):
     uid = message.from_user.id
+    
     if uid in stop_dict and not stop_dict[uid]:
         stop_dict[uid] = True
-        await message.reply_text("🛑 Stopping...")
+        await message.reply_text(
+            "🛑 **Stopping download...**\n\n"
+            "Please wait while cleanup happens."
+        )
     else:
-        await message.reply_text("No active download")
+        await message.reply_text("ℹ️ No active download to stop")
 
 @app.on_message(filters.text & filters.regex(r"terabox|1024tera|momerybox|teraboxapp"))
 async def handle_url(client, message):
@@ -291,8 +409,13 @@ async def handle_url(client, message):
     
     if tera:
         uid = message.from_user.id
+        
+        # Check if already processing
         if uid in stop_dict and not stop_dict[uid]:
-            await message.reply_text("⚠️ Already processing! Wait or /stop")
+            await message.reply_text(
+                "⚠️ **Already processing a file!**\n\n"
+                "Please wait for current download to finish or use /stop to cancel it."
+            )
             return
         
         await process_link(client, message, tera[0])
@@ -300,5 +423,7 @@ async def handle_url(client, message):
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.create_task(web_server())
-    print("Bot started - Download-first mode")
+    print("🚀 Terabox Downloader Pro - Started!")
+    print(f"📁 Download directory: {DOWNLOAD_DIR.absolute()}")
+    print(f"💾 Max file size: {humanbytes(MAX_FILE_SIZE)}")
     app.run()
