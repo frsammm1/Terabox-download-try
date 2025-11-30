@@ -21,7 +21,7 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # Memory management
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB limit
-CHUNK_SIZE = 1024 * 1024  # 1MB chunks for better memory handling
+CHUNK_SIZE = 5 * 1024 * 1024  # 5MB chunks - AGGRESSIVE for speed
 
 app = Client("terabox_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 stop_dict = {}
@@ -133,21 +133,25 @@ async def download_file(url, filepath, cookie, status_msg, uid):
         'Referer': 'https://www.terabox.com/',
         'Accept': '*/*',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Connection': 'keep-alive'
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Range': f'bytes=0-',  # Enable range requests
     }
     
-    # Aggressive timeout for large files
+    # AGGRESSIVE timeout for speed
     timeout = aiohttp.ClientTimeout(
-        total=None,  # No total timeout
-        connect=30,
-        sock_read=120  # 2 minutes read timeout
+        total=None,
+        connect=20,  # Faster connection
+        sock_read=180  # 3 min for large chunks
     )
     
     connector = aiohttp.TCPConnector(
         ssl=False,
-        limit=5,
-        force_close=False,  # Keep connection alive
-        enable_cleanup_closed=True
+        limit=20,  # More concurrent connections
+        limit_per_host=10,
+        force_close=False,
+        enable_cleanup_closed=True,
+        ttl_dns_cache=300  # DNS cache for speed
     )
     
     downloaded = 0
@@ -175,21 +179,35 @@ async def download_file(url, filepath, cookie, status_msg, uid):
                 f"**File:** `{filepath.name}`"
             )
             
-            # Download with chunked writing
+            # Download with AGGRESSIVE chunked writing
             with open(filepath, 'wb') as f:
+                buffer = bytearray()  # Buffer for batch writing
+                
                 async for chunk in response.content.iter_chunked(CHUNK_SIZE):
                     
                     if stop_dict.get(uid, False):
                         raise Exception("Download cancelled by user")
                     
-                    f.write(chunk)
-                    downloaded += len(chunk)
+                    buffer.extend(chunk)
                     
-                    # Update progress every 1.5 seconds OR every 10MB
-                    now = time.time()
-                    if (now - last_update >= 1.5) or (downloaded % (10 * 1024 * 1024) < CHUNK_SIZE):
-                        await download_progress(downloaded, total_size, status_msg, start_time, uid, "📥 Downloading")
-                        last_update = now
+                    # Write buffer to disk every 10MB (reduces I/O operations)
+                    if len(buffer) >= 10 * 1024 * 1024:
+                        f.write(buffer)
+                        downloaded += len(buffer)
+                        buffer.clear()
+                        
+                        # Update progress
+                        now = time.time()
+                        if (now - last_update >= 1.5):
+                            await download_progress(downloaded, total_size, status_msg, start_time, uid, "📥 Downloading")
+                            last_update = now
+                    else:
+                        downloaded += len(chunk)
+                
+                # Write remaining buffer
+                if buffer:
+                    f.write(buffer)
+                    buffer.clear()
             
             # Final progress
             await download_progress(downloaded, total_size, status_msg, start_time, uid, "📥 Download Complete")
@@ -197,19 +215,22 @@ async def download_file(url, filepath, cookie, status_msg, uid):
             return total_size
 
 async def get_direct_link(url):
-    """Extract direct download link from Terabox"""
+    """Extract direct download link from Terabox - OPTIMIZED"""
     try:
         # Normalize URL
         clean = re.sub(r"https?://[a-zA-Z0-9.-]+", "https://www.terabox.com", url)
         
+        # Use async HTTP instead of TeraboxDL for speed
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Cookie': TERABOX_COOKIE,
+        }
+        
+        # Try TeraboxDL library first
         dl = TeraboxDL(TERABOX_COOKIE)
         loop = asyncio.get_event_loop()
         
-        # Run in executor to avoid blocking
-        result = await loop.run_in_executor(
-            None,
-            lambda: dl.get_file_info(clean)
-        )
+        result = await loop.run_in_executor(None, lambda: dl.get_file_info(clean))
         
         if not result:
             return None, None, None
@@ -371,6 +392,8 @@ async def start_cmd(client, message):
         "🚀 **Terabox Downloader Pro**\n\n"
         "**✨ Features:**\n"
         "• Download files up to 2GB\n"
+        "• Optimized for maximum speed\n"
+        "• 5MB chunk downloads (aggressive)\n"
         "• Real-time progress tracking\n"
         "• Speed & ETA display\n"
         "• Auto cleanup after upload\n\n"
@@ -423,7 +446,9 @@ async def handle_url(client, message):
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.create_task(web_server())
-    print("🚀 Terabox Downloader Pro - Started!")
+    print("🚀 Terabox Downloader Pro - SPEED OPTIMIZED!")
     print(f"📁 Download directory: {DOWNLOAD_DIR.absolute()}")
     print(f"💾 Max file size: {humanbytes(MAX_FILE_SIZE)}")
+    print(f"⚡ Chunk size: {humanbytes(CHUNK_SIZE)} (Aggressive mode)")
+    print(f"🔥 Connection limit: 20 (Max speed)")
     app.run()
