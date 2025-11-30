@@ -564,6 +564,6 @@ if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.create_task(web_server())
     print("Terabox Downloader - OPTIMIZED Started!")
-    print(f"Download directory: {DOWNLOAD_DIR.absolute()}")
-    print(f"Max file size: {humanbytes(MAX_FILE_SIZE)}")
-    print(f"Chunk size: {huma
+    print("Download directory:", DOWNLOAD_DIR.absolute())
+    print("Max file size:", humanbytes(MAX_FILE_SIZE))
+    print("Chunk size:", humanbyt
