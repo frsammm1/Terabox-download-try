@@ -12,10 +12,20 @@ API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get("PORT", 8080))
+YT_COOKIES = os.environ.get("YT_COOKIES") # New Variable
 
 app = Client("yt_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# --- WEB SERVER (Keep Alive) ---
+# --- Cookie Setup ---
+# Bot start hote hi cookies file bana dega
+if YT_COOKIES:
+    with open("cookies.txt", "w") as f:
+        f.write(YT_COOKIES)
+    print("✅ Cookies loaded from Env Var")
+else:
+    print("⚠️ Warning: YT_COOKIES not found!")
+
+# --- WEB SERVER ---
 async def web_server():
     async def handle_ping(request):
         return web.Response(text="YT Bot Alive")
@@ -64,47 +74,42 @@ async def progress_bar(current, total, message, start_time):
 
 # --- DOWNLOAD LOGIC ---
 async def download_video(url, message):
-    status_msg = await message.reply_text("🔎 **Fetching Info...**")
+    status_msg = await message.reply_text("🔎 **Checking...**")
     
-    # Output filename template
     output_path = f"downloads/{message.id}.%(ext)s"
     
+    # Options update kiye hain authentication ke liye
     ydl_opts = {
         'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_path,
         'geo_bypass': True,
         'nocheckcertificate': True,
         'quiet': True,
+        'cookiefile': 'cookies.txt', # <--- Ye line cookies use karegi
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # 1. Info Extract
             info = ydl.extract_info(url, download=False)
             title = info.get('title', 'Video')
             duration = info.get('duration', 0)
             
             await status_msg.edit_text(f"⬇️ **Downloading:** `{title}`")
             
-            # 2. Download
-            # Note: yt-dlp sync chalta hai, isliye executor me run karenge taki bot na ruke
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, lambda: ydl.download([url]))
             
-            # Find the file (extension can vary)
             filename = f"downloads/{message.id}.mp4"
             if not os.path.exists(filename):
-                 # Fallback check agar mkv ya webm me aaya
                  for file in os.listdir("downloads"):
                      if file.startswith(str(message.id)):
                          filename = f"downloads/{file}"
                          break
             
             if not os.path.exists(filename):
-                await status_msg.edit_text("❌ Download Failed (File not found).")
+                await status_msg.edit_text("❌ Download Failed.")
                 return
 
-            # 3. Upload
             await status_msg.edit_text("🚀 **Uploading...**")
             start_time = time.time()
             
@@ -119,13 +124,10 @@ async def download_video(url, message):
             )
             
             await status_msg.delete()
-            
-            # 4. Cleanup
             os.remove(filename)
 
     except Exception as e:
         await status_msg.edit_text(f"⚠️ **Error:** {e}")
-        # Cleanup if failed
         if os.path.exists(f"downloads/{message.id}.mp4"):
             os.remove(f"downloads/{message.id}.mp4")
 
@@ -139,14 +141,12 @@ async def handle_yt(client, message):
     url = message.text
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
-        
     await download_video(url, message)
 
 if __name__ == "__main__":
     if not os.path.exists("downloads"):
         os.makedirs("downloads")
-    
     loop = asyncio.get_event_loop()
     loop.create_task(web_server())
     app.run()
-        
+            
