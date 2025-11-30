@@ -12,23 +12,22 @@ API_ID = int(os.environ.get("API_ID"))
 API_HASH = os.environ.get("API_HASH")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get("PORT", 8080))
-YT_COOKIES = os.environ.get("YT_COOKIES") # New Variable
+YT_COOKIES = os.environ.get("YT_COOKIES")
 
 app = Client("yt_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # --- Cookie Setup ---
-# Bot start hote hi cookies file bana dega
 if YT_COOKIES:
     with open("cookies.txt", "w") as f:
         f.write(YT_COOKIES)
-    print("✅ Cookies loaded from Env Var")
+    print("✅ Cookies loaded")
 else:
-    print("⚠️ Warning: YT_COOKIES not found!")
+    print("⚠️ Warning: No Cookies")
 
 # --- WEB SERVER ---
 async def web_server():
     async def handle_ping(request):
-        return web.Response(text="YT Bot Alive")
+        return web.Response(text="Alive")
     webapp = web.Application()
     webapp.router.add_get("/", handle_ping)
     runner = web.AppRunner(webapp)
@@ -72,20 +71,29 @@ async def progress_bar(current, total, message, start_time):
         try: await message.edit_text(tmp)
         except: pass
 
-# --- DOWNLOAD LOGIC ---
+# --- DOWNLOAD LOGIC (ANDROID MODE FIX) ---
 async def download_video(url, message):
-    status_msg = await message.reply_text("🔎 **Checking...**")
+    status_msg = await message.reply_text("🔎 **Android Mode: Fetching...**")
     
     output_path = f"downloads/{message.id}.%(ext)s"
     
-    # Options update kiye hain authentication ke liye
+    # --- YAHAN HAI MAGIC FIX ---
     ydl_opts = {
         'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_path,
         'geo_bypass': True,
         'nocheckcertificate': True,
         'quiet': True,
-        'cookiefile': 'cookies.txt', # <--- Ye line cookies use karegi
+        'cookiefile': 'cookies.txt',
+        
+        # 1. Android Client Bano (IP restrictions kam hoti hain)
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web'],
+            }
+        },
+        # 2. User Agent Spoofing (Taki lage mobile hai)
+        'user_agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36',
     }
 
     try:
@@ -100,6 +108,7 @@ async def download_video(url, message):
             await loop.run_in_executor(None, lambda: ydl.download([url]))
             
             filename = f"downloads/{message.id}.mp4"
+            # Fallback finder
             if not os.path.exists(filename):
                  for file in os.listdir("downloads"):
                      if file.startswith(str(message.id)):
@@ -107,7 +116,7 @@ async def download_video(url, message):
                          break
             
             if not os.path.exists(filename):
-                await status_msg.edit_text("❌ Download Failed.")
+                await status_msg.edit_text("❌ Download Failed (File not generated).")
                 return
 
             await status_msg.edit_text("🚀 **Uploading...**")
@@ -128,13 +137,14 @@ async def download_video(url, message):
 
     except Exception as e:
         await status_msg.edit_text(f"⚠️ **Error:** {e}")
+        # Error cleanup
         if os.path.exists(f"downloads/{message.id}.mp4"):
             os.remove(f"downloads/{message.id}.mp4")
 
 # --- HANDLERS ---
 @app.on_message(filters.command("start"))
 async def start(client, message):
-    await message.reply_text("👋 **YouTube Downloader Ready!**\nLink bhejo (Shorts/Video).")
+    await message.reply_text("👋 **YouTube Downloader (Android Mode)**\nLink bhejo!")
 
 @app.on_message(filters.regex(r"(?:https?:\/\/)?(?:www\.)?(?:youtube\.com|youtu\.be)\/(?:watch\?v=)?([a-zA-Z0-9_-]+)"))
 async def handle_yt(client, message):
