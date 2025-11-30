@@ -19,10 +19,11 @@ PORT = int(os.environ.get("PORT", 8080))
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
-# OPTIMIZED MEMORY MANAGEMENT
+# ULTRA OPTIMIZED SETTINGS - MAXIMUM SPEED
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # 2GB limit
-CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks for SPEED BOOST
-BUFFER_SIZE = 40 * 1024 * 1024  # 40MB buffer (8MB × 5) for write optimization
+CHUNK_SIZE = 8 * 1024 * 1024  # 8MB chunks
+BUFFER_SIZE = 96 * 1024 * 1024  # 96MB buffer (8MB × 12) BEAST MODE
+MAX_CONCURRENT_CHUNKS = 3  # Parallel chunk downloads
 
 app = Client("terabox_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 stop_dict = {}
@@ -69,8 +70,8 @@ async def download_progress(current, total, msg, start, uid, phase="Downloading"
     now = time.time()
     diff = now - start
     
-    # Update every 2 seconds (reduced API calls)
-    if diff < 2:
+    # Update every 3 seconds (minimal API overhead)
+    if diff < 3:
         return
     
     percent = (current * 100) / total if total > 0 else 0
@@ -102,7 +103,7 @@ async def upload_progress(current, total, msg, start, uid):
     now = time.time()
     diff = now - start
     
-    if diff < 2:
+    if diff < 3:
         return
     
     percent = (current * 100) / total if total > 0 else 0
@@ -125,8 +126,18 @@ async def upload_progress(current, total, msg, start, uid):
     except:
         pass
 
-async def download_file(url, filepath, cookie, status_msg, uid):
-    """OPTIMIZED download with 8MB chunks and buffered writes"""
+async def download_chunk_range(session, url, headers, start_byte, end_byte):
+    """Download a specific byte range - for parallel downloading"""
+    range_headers = headers.copy()
+    range_headers['Range'] = f'bytes={start_byte}-{end_byte}'
+    
+    async with session.get(url, headers=range_headers) as response:
+        if response.status in (200, 206):  # 206 = Partial Content
+            return await response.read()
+    return None
+
+async def download_file_parallel(url, filepath, cookie, status_msg, uid):
+    """PARALLEL DOWNLOAD with multiple connections - BEAST MODE"""
     
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0',
@@ -138,96 +149,144 @@ async def download_file(url, filepath, cookie, status_msg, uid):
         'Accept-Encoding': 'gzip, deflate, br'
     }
     
-    # OPTIMIZED timeout settings for large chunks
+    # AGGRESSIVE timeout for parallel downloads
     timeout = aiohttp.ClientTimeout(
-        total=None,  # No total timeout
+        total=None,
         connect=30,
-        sock_read=180  # 3 minutes for 8MB chunks
+        sock_read=240  # 4 minutes for large chunks
     )
     
-    # OPTIMIZED connector for better throughput
+    # BEAST MODE connector
     connector = aiohttp.TCPConnector(
         ssl=False,
-        limit=10,  # Increased from 5
-        limit_per_host=5,
+        limit=15,  # Even more connections
+        limit_per_host=8,
         force_close=False,
         enable_cleanup_closed=True,
-        ttl_dns_cache=300
+        ttl_dns_cache=600,  # 10 min DNS cache
+        keepalive_timeout=60
     )
     
     downloaded = 0
     start_time = time.time()
     last_update = start_time
-    buffer = bytearray()  # Buffer for batch writes
     
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        async with session.get(url, headers=headers) as response:
-            
+        # First, get file size
+        async with session.head(url, headers=headers) as response:
             if response.status != 200:
                 raise Exception(f"HTTP {response.status} - Server rejected request")
             
             total_size = int(response.headers.get('Content-Length', 0))
+            accepts_ranges = response.headers.get('Accept-Ranges', 'none') == 'bytes'
+        
+        if total_size == 0:
+            raise Exception("Content-Length is 0 - Terabox blocked the IP/request")
+        
+        if total_size > MAX_FILE_SIZE:
+            raise Exception(f"File too large: {humanbytes(total_size)} (Max: 2GB)")
+        
+        # Initial status
+        await status_msg.edit_text(
+            f"⚡ **BEAST MODE ACTIVATED!**\n\n"
+            f"**Size:** {humanbytes(total_size)}\n"
+            f"**Chunk:** 8MB\n"
+            f"**Buffer:** 96MB (8×12)\n"
+            f"**Parallel:** {'YES' if accepts_ranges else 'NO'}\n"
+            f"**File:** `{filepath.name}`"
+        )
+        
+        # Strategy: If server supports range requests, download in parallel
+        if accepts_ranges and total_size > 50 * 1024 * 1024:  # Only for files > 50MB
+            await download_parallel_chunks(session, url, headers, filepath, total_size, status_msg, start_time, uid)
+        else:
+            # Fallback: Sequential download with large buffer
+            await download_sequential(session, url, headers, filepath, total_size, status_msg, start_time, uid)
+        
+        return total_size
+
+async def download_parallel_chunks(session, url, headers, filepath, total_size, status_msg, start_time, uid):
+    """Download file in parallel chunks"""
+    
+    chunk_tasks = []
+    chunk_results = {}
+    downloaded = 0
+    last_update = start_time
+    
+    # Split file into 3 parallel chunks
+    chunk_size = total_size // MAX_CONCURRENT_CHUNKS
+    
+    for i in range(MAX_CONCURRENT_CHUNKS):
+        start_byte = i * chunk_size
+        end_byte = start_byte + chunk_size - 1 if i < MAX_CONCURRENT_CHUNKS - 1 else total_size - 1
+        
+        task = asyncio.create_task(download_chunk_range(session, url, headers, start_byte, end_byte))
+        chunk_tasks.append((i, start_byte, task))
+    
+    # Write chunks as they complete
+    with open(filepath, 'wb') as f:
+        for i, start_byte, task in chunk_tasks:
+            if stop_dict.get(uid, False):
+                raise Exception("Cancelled")
             
-            if total_size == 0:
-                raise Exception("Content-Length is 0 - Terabox blocked the IP/request")
+            chunk_data = await task
             
-            if total_size > MAX_FILE_SIZE:
-                raise Exception(f"File too large: {humanbytes(total_size)} (Max: 2GB)")
-            
-            # Initial status
-            await status_msg.edit_text(
-                f"🚀 **Starting download...**\n\n"
-                f"**Size:** {humanbytes(total_size)}\n"
-                f"**Chunk:** 8MB (Optimized)\n"
-                f"**File:** `{filepath.name}`"
-            )
-            
-            # OPTIMIZED: Download with buffered writing
-            with open(filepath, 'wb', buffering=BUFFER_SIZE) as f:
-                async for chunk in response.content.iter_chunked(CHUNK_SIZE):
-                    
-                    if stop_dict.get(uid, False):
-                        raise Exception("Download cancelled by user")
-                    
-                    # Write to buffer
-                    buffer.extend(chunk)
-                    downloaded += len(chunk)
-                    
-                    # Flush buffer when it reaches 40MB or at end
-                    if len(buffer) >= BUFFER_SIZE or downloaded >= total_size:
-                        f.write(buffer)
-                        buffer.clear()
-                    
-                    # Update progress every 2 seconds OR every 40MB
-                    now = time.time()
-                    if (now - last_update >= 2) or (downloaded % BUFFER_SIZE < CHUNK_SIZE):
-                        await download_progress(downloaded, total_size, status_msg, start_time, uid, "🚀 Downloading")
-                        last_update = now
+            if chunk_data:
+                # Seek to correct position and write
+                f.seek(start_byte)
+                f.write(chunk_data)
                 
-                # Flush remaining buffer
-                if buffer:
+                downloaded += len(chunk_data)
+                
+                now = time.time()
+                if now - last_update >= 3:
+                    await download_progress(downloaded, total_size, status_msg, start_time, uid, "⚡ PARALLEL DOWNLOAD")
+                    last_update = now
+    
+    await download_progress(total_size, total_size, status_msg, start_time, uid, "✅ Download Complete")
+
+async def download_sequential(session, url, headers, filepath, total_size, status_msg, start_time, uid):
+    """Fallback: Sequential download with mega buffer"""
+    
+    downloaded = 0
+    last_update = start_time
+    buffer = bytearray()
+    
+    async with session.get(url, headers=headers) as response:
+        with open(filepath, 'wb', buffering=BUFFER_SIZE) as f:
+            async for chunk in response.content.iter_chunked(CHUNK_SIZE):
+                
+                if stop_dict.get(uid, False):
+                    raise Exception("Cancelled")
+                
+                buffer.extend(chunk)
+                downloaded += len(chunk)
+                
+                # Flush buffer at 96MB or end
+                if len(buffer) >= BUFFER_SIZE or downloaded >= total_size:
                     f.write(buffer)
                     buffer.clear()
+                
+                now = time.time()
+                if (now - last_update >= 3) or (downloaded % BUFFER_SIZE < CHUNK_SIZE):
+                    await download_progress(downloaded, total_size, status_msg, start_time, uid, "🚀 TURBO DOWNLOAD")
+                    last_update = now
             
-            # Final progress
-            await download_progress(downloaded, total_size, status_msg, start_time, uid, "✅ Download Complete")
-            
-            return total_size
+            if buffer:
+                f.write(buffer)
+                buffer.clear()
+    
+    await download_progress(total_size, total_size, status_msg, start_time, uid, "✅ Download Complete")
 
 async def get_direct_link(url):
     """Extract direct download link from Terabox"""
     try:
-        # Normalize URL
         clean = re.sub(r"https?://[a-zA-Z0-9.-]+", "https://www.terabox.com", url)
         
         dl = TeraboxDL(TERABOX_COOKIE)
         loop = asyncio.get_event_loop()
         
-        # Run in executor to avoid blocking
-        result = await loop.run_in_executor(
-            None,
-            lambda: dl.get_file_info(clean)
-        )
+        result = await loop.run_in_executor(None, lambda: dl.get_file_info(clean))
         
         if not result:
             return None, None, None
@@ -278,14 +337,14 @@ async def process_link(client: Client, message: Message, url: str):
             f"✅ **Step 1:** Link extracted!\n\n"
             f"**📄 File:** `{filename}`\n"
             f"**📦 Size:** {size_text}\n\n"
-            f"🚀 **Step 2/4:** Downloading (8MB chunks)..."
+            f"⚡ **Step 2/4:** BEAST MODE Download..."
         )
         
         # Step 2: Download file
         filepath = DOWNLOAD_DIR / f"{uid}_{int(time.time())}_{filename}"
         
         try:
-            downloaded_size = await download_file(direct, filepath, TERABOX_COOKIE, status, uid)
+            downloaded_size = await download_file_parallel(direct, filepath, TERABOX_COOKIE, status, uid)
             
             await status.edit_text(
                 f"✅ **Step 2:** Downloaded {humanbytes(downloaded_size)}\n\n"
@@ -311,24 +370,21 @@ async def process_link(client: Client, message: Message, url: str):
         # Step 3: Upload to Telegram
         upload_start = time.time()
         
-        # Check file exists and has content
         if not filepath.exists() or filepath.stat().st_size == 0:
             await status.edit_text("❌ **Downloaded file is empty or missing!**")
             return
         
         try:
-            # Try as video first (better for media files)
             await client.send_video(
                 chat_id=message.chat.id,
                 video=str(filepath),
-                caption=f"🎬 **{filename}**\n\n📦 Size: {humanbytes(downloaded_size)}\n⚡ Downloaded from Terabox",
+                caption=f"🎬 **{filename}**\n\n📦 Size: {humanbytes(downloaded_size)}\n⚡ Beast Mode Download",
                 supports_streaming=True,
                 progress=upload_progress,
                 progress_args=(status, upload_start, uid)
             )
             
         except Exception as vid_err:
-            # Fallback: Send as document
             await status.edit_text(
                 "⚠️ Video upload failed, sending as document...\n\n"
                 "This is normal for non-video files."
@@ -351,7 +407,6 @@ async def process_link(client: Client, message: Message, url: str):
         await asyncio.sleep(1)
         await status.delete()
         
-        # Success message
         total_time = time.time() - upload_start
         await message.reply_text(
             f"✅ **Upload Complete!** 🎉\n\n"
@@ -373,7 +428,6 @@ async def process_link(client: Client, message: Message, url: str):
             )
     
     finally:
-        # Always cleanup
         stop_dict[uid] = False
         
         if filepath and filepath.exists():
@@ -386,23 +440,27 @@ async def process_link(client: Client, message: Message, url: str):
 @app.on_message(filters.command("start"))
 async def start_cmd(client, message):
     await message.reply_text(
-        "🚀 **Terabox Downloader Pro**\n\n"
-        "**✨ Features:**\n"
+        "⚡ **Terabox Downloader - BEAST MODE**\n\n"
+        "**🔥 Ultra Features:**\n"
         "• Download files up to 2GB\n"
-        "• 8MB chunks for speed\n"
-        "• 40MB buffered writes\n"
+        "• 8MB chunk size\n"
+        "• 96MB mega buffer (8×12)\n"
+        "• Parallel downloads (3 streams)\n"
         "• Real-time progress tracking\n"
         "• Speed & ETA display\n"
         "• Auto cleanup after upload\n\n"
         "**📥 How to use:**\n"
         "1. Send any Terabox link\n"
-        "2. Bot downloads to server\n"
+        "2. Bot downloads at MAX SPEED\n"
         "3. Bot uploads to Telegram\n"
         "4. File sent to you!\n\n"
-        "**⚙️ Optimizations:**\n"
+        "**⚙️ BEAST MODE Optimizations:**\n"
         "• 8MB chunk size (8x faster)\n"
-        "• 40MB write buffer\n"
-        "• Better connection pooling\n\n"
+        "• 96MB write buffer (8×12)\n"
+        "• Parallel downloading (3 connections)\n"
+        "• Extended DNS caching (10 min)\n"
+        "• Keep-alive connections (60s)\n"
+        "• 15 concurrent connections\n\n"
         "**⚠️ Limitations:**\n"
         "• Free tier: 512MB RAM, limited bandwidth\n"
         "• Some IPs blocked by Terabox\n"
@@ -434,7 +492,6 @@ async def handle_url(client, message):
     if tera:
         uid = message.from_user.id
         
-        # Check if already processing
         if uid in stop_dict and not stop_dict[uid]:
             await message.reply_text(
                 "⚠️ **Already processing a file!**\n\n"
@@ -447,9 +504,10 @@ async def handle_url(client, message):
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.create_task(web_server())
-    print("🚀 Terabox Downloader Pro - OPTIMIZED Started!")
+    print("⚡ Terabox Downloader - BEAST MODE ACTIVATED!")
     print(f"📁 Download directory: {DOWNLOAD_DIR.absolute()}")
     print(f"💾 Max file size: {humanbytes(MAX_FILE_SIZE)}")
     print(f"⚡ Chunk size: {humanbytes(CHUNK_SIZE)}")
     print(f"📦 Buffer size: {humanbytes(BUFFER_SIZE)}")
+    print(f"🔥 Parallel streams: {MAX_CONCURRENT_CHUNKS}")
     app.run()
