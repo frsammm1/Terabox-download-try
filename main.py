@@ -23,11 +23,11 @@ TG_SPLIT_LIMIT = 2000 * 1024 * 1024
 app = Client("terabox_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 stop_dict = {}
 
-# FREE PROXY SERVICES - Ye Terabox block bypass karenge
+# FREE PROXY SERVICES
 PROXY_SERVICES = [
-    "https://api.allorigins.win/raw?url=",  # AllOrigins
-    "https://corsproxy.io/?",  # CORS Proxy
-    "https://api.codetabs.com/v1/proxy?quest=",  # CodeTabs
+    "https://api.allorigins.win/raw?url=",
+    "https://corsproxy.io/?",
+    "https://api.codetabs.com/v1/proxy?quest=",
 ]
 
 # --- WEB SERVER ---
@@ -82,16 +82,17 @@ async def progress_bar(current, total, message, start_time, user_id):
         except: 
             pass
 
-# --- ADVANCED STREAMING CLASS ---
-class SuperStream:
-    def __init__(self, session, url, filename, headers, user_id, use_proxy=False):
+# --- PROPER FILE STREAM CLASS (BytesIO BASE) ---
+class ProxyStream(io.BytesIO):
+    """Pyrogram-compatible streaming class with proxy support"""
+    
+    def __init__(self, session, url, filename, headers, user_id):
+        super().__init__()
         self.session = session
         self.original_url = url
-        self.url = url
         self.filename = filename
         self.headers = headers
         self.user_id = user_id
-        self.use_proxy = use_proxy
         self.name = filename
         self.mode = 'rb'
         
@@ -99,153 +100,167 @@ class SuperStream:
         self.total_size = 0
         self.response = None
         self.failed_proxies = set()
+        self.using_proxy = False
+        self._closed = False
         
-    async def __aenter__(self):
-        # Agar proxy mode hai to proxy ke through connect karo
-        if self.use_proxy:
-            success = await self._connect_via_proxy()
-            if not success:
-                # Sab proxy fail, direct try karo
-                self.use_proxy = False
-                await self._connect_direct()
-        else:
-            await self._connect_direct()
+    async def initialize(self):
+        """Connection setup - proxy first, then direct"""
+        
+        # Try proxy first
+        success = await self._try_proxy_connection()
+        
+        if not success:
+            # Fallback to direct
+            await self._try_direct_connection()
             
         return self
-
-    async def _connect_via_proxy(self):
-        """Proxy services try karo ek ek karke"""
-        available_proxies = [p for p in PROXY_SERVICES if p not in self.failed_proxies]
+    
+    async def _try_proxy_connection(self):
+        """Try connecting via free proxies"""
+        available = [p for p in PROXY_SERVICES if p not in self.failed_proxies]
         
-        if not available_proxies:
-            return False
-            
-        # Random proxy select karo
-        proxy = random.choice(available_proxies)
-        proxied_url = f"{proxy}{self.original_url}"
-        
-        try:
-            timeout = aiohttp.ClientTimeout(total=None, connect=25, sock_read=60)
-            
-            self.response = await self.session.get(
-                proxied_url,
-                headers={'User-Agent': self.headers['User-Agent']},  # Proxy ko sirf UA bhejo
-                timeout=timeout,
-                allow_redirects=True
-            )
-            
-            if self.response.status == 200:
-                self.total_size = int(self.response.headers.get('Content-Length', 0))
-                
-                # Test read - verify data aa raha hai
-                test_data = await asyncio.wait_for(self.response.content.read(8192), timeout=15)
-                
-                if test_data:
-                    # Success! Is proxy ka URL use karo
-                    self.url = proxied_url
-                    # Test data ko current byte mein add karo
-                    self.current_byte = len(test_data)
-                    # Aur ye data return karne ke liye store karo
-                    self._buffer = test_data
-                    return True
-                    
-            self.failed_proxies.add(proxy)
-            return False
-            
-        except Exception as e:
-            self.failed_proxies.add(proxy)
-            return False
-
-    async def _connect_direct(self):
-        """Direct connection - original method"""
-        timeout = aiohttp.ClientTimeout(total=None, connect=20, sock_read=60)
-        
-        connector = aiohttp.TCPConnector(
-            family=socket.AF_INET,
-            ssl=False,
-            limit=5,
-            force_close=False
-        )
-        
-        # Multiple attempts with different headers
-        for attempt in range(3):
+        for proxy_url in available:
             try:
-                # Har attempt pe thoda headers change karo
-                dynamic_headers = self.headers.copy()
-                dynamic_headers['User-Agent'] = random.choice([
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-                    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
-                ])
+                proxied = f"{proxy_url}{self.original_url}"
+                
+                timeout = aiohttp.ClientTimeout(total=None, connect=20, sock_read=45)
                 
                 self.response = await self.session.get(
-                    self.original_url,
-                    headers=dynamic_headers,
+                    proxied,
+                    headers={'User-Agent': self.headers['User-Agent']},
                     timeout=timeout,
                     allow_redirects=True
                 )
                 
                 if self.response.status == 200:
-                    self.total_size = int(self.response.headers.get('Content-Length', 0))
+                    # Test actual data flow
+                    test = await asyncio.wait_for(
+                        self.response.content.read(16384),
+                        timeout=12
+                    )
                     
-                    # Verify connection
-                    test_data = await asyncio.wait_for(self.response.content.read(8192), timeout=10)
-                    if test_data:
-                        self._buffer = test_data
-                        self.current_byte = len(test_data)
+                    if test:
+                        self.total_size = int(self.response.headers.get('Content-Length', 0))
+                        if self.total_size == 0:
+                            # Estimate from test chunk
+                            self.total_size = 200 * 1024 * 1024
+                        
+                        # Write test data to buffer
+                        super().write(test)
+                        super().seek(0)
+                        self.current_byte = len(test)
+                        self.using_proxy = True
+                        return True
+                        
+            except Exception:
+                self.failed_proxies.add(proxy_url)
+                if self.response:
+                    self.response.close()
+                continue
+                
+        return False
+    
+    async def _try_direct_connection(self):
+        """Direct connection without proxy"""
+        timeout = aiohttp.ClientTimeout(total=None, connect=20, sock_read=50)
+        
+        connector = aiohttp.TCPConnector(
+            family=socket.AF_INET,
+            ssl=False,
+            limit=10
+        )
+        
+        for attempt in range(3):
+            try:
+                # Rotate User-Agent
+                headers = self.headers.copy()
+                headers['User-Agent'] = random.choice([
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0',
+                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/537.36',
+                    'Mozilla/5.0 (X11; Linux x86_64) Firefox/122.0'
+                ])
+                
+                self.response = await self.session.get(
+                    self.original_url,
+                    headers=headers,
+                    timeout=timeout,
+                    allow_redirects=True
+                )
+                
+                if self.response.status == 200:
+                    test = await asyncio.wait_for(
+                        self.response.content.read(16384),
+                        timeout=10
+                    )
+                    
+                    if test:
+                        self.total_size = int(self.response.headers.get('Content-Length', 0))
+                        if self.total_size == 0:
+                            self.total_size = 200 * 1024 * 1024
+                        
+                        super().write(test)
+                        super().seek(0)
+                        self.current_byte = len(test)
                         return
                         
-                await asyncio.sleep(2 * (attempt + 1))
-                
             except Exception as e:
                 if attempt == 2:
-                    raise Exception(f"Direct connection failed: {str(e)}")
-                await asyncio.sleep(3)
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.response:
-            self.response.close()
-
-    async def read(self, size=-1):
+                    raise Exception(f"Connection failed: {str(e)}")
+                await asyncio.sleep(2 * (attempt + 1))
+    
+    async def read_async(self, size=-1):
+        """Async read method"""
         if stop_dict.get(self.user_id, False):
             return b""
             
         if self.current_byte >= TG_SPLIT_LIMIT:
             return b""
         
-        # Pehle buffer se return karo agar hai
-        if hasattr(self, '_buffer') and self._buffer:
-            data = self._buffer
-            delattr(self, '_buffer')
-            return data
-            
+        # First check if BytesIO buffer has data
+        buffered = super().read(size if size > 0 else -1)
+        if buffered:
+            return buffered
+        
+        # Read from network
         if not self.response:
             return b""
         
         try:
             chunk = await asyncio.wait_for(
-                self.response.content.read(size if size > 0 else 1024*1024),
-                timeout=45
+                self.response.content.read(size if size > 0 else 1048576),
+                timeout=40
             )
             
             if chunk:
                 self.current_byte += len(chunk)
+                # Write to internal buffer
+                pos = super().tell()
+                super().write(chunk)
+                super().seek(pos)
                 return chunk
+                
             return b""
             
         except asyncio.TimeoutError:
-            # Timeout pe proxy try karo agar abhi tak nahi kiya
-            if not self.use_proxy:
-                # Switch to proxy mode
-                self.use_proxy = True
-                if await self._connect_via_proxy():
-                    return await self.read(size)
             return b""
         except Exception:
             return b""
-
+    
+    def read(self, size=-1):
+        """Sync read wrapper for Pyrogram"""
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(self.read_async(size))
+    
+    def close(self):
+        """Close stream and cleanup"""
+        if not self._closed:
+            self._closed = True
+            if self.response:
+                self.response.close()
+            super().close()
+    
     def __len__(self):
-        return max(self.total_size, 50 * 1024 * 1024)  # Minimum 50MB estimate
+        return max(self.total_size, 100 * 1024 * 1024)
 
 # --- LINK EXTRACTOR ---
 async def get_direct_link(terabox_url):
@@ -264,7 +279,7 @@ async def get_direct_link(terabox_url):
         filename = file_info.get('server_filename', 'terabox_file.mp4')
         
         return dlink, filename
-    except Exception:
+    except Exception as e:
         return None, None
 
 # --- MAIN PROCESSOR ---
@@ -280,14 +295,14 @@ async def process_single_link(client: Client, message: Message, terabox_url: str
         if not direct_url:
             await status.edit_text(
                 "❌ **Link extraction failed!**\n\n"
-                "**Possible reasons:**\n"
-                "• Invalid/expired link\n"
-                "• Cookie expired (update TERABOX_COOKIE)\n"
-                "• Terabox API changed"
+                "**Check:**\n"
+                "• Link validity\n"
+                "• TERABOX_COOKIE in env\n"
+                "• Cookie not expired"
             )
             return
 
-        await status.edit_text(f"✅ **Link extracted!**\n📄 `{filename}`\n\n🚀 Starting download...")
+        await status.edit_text(f"✅ **Got it!**\n📄 `{filename}`\n\n🔗 Connecting...")
         
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -302,72 +317,58 @@ async def process_single_link(client: Client, message: Message, terabox_url: str
         async with aiohttp.ClientSession(connector=connector) as session:
             start_time = time.time()
             
-            # FIRST TRY: Proxy se try karo (Render IP bypass)
-            await status.edit_text("🌐 **Connecting via proxy...**")
+            # Create stream
+            stream = ProxyStream(session, direct_url, filename, headers, user_id)
             
             try:
-                async with SuperStream(session, direct_url, filename, headers, user_id, use_proxy=True) as stream:
-                    
-                    if stop_dict.get(user_id):
-                        await status.edit_text("❌ Cancelled")
-                        return
-                    
-                    await status.edit_text("📤 **Uploading to Telegram...**")
-                    
-                    # Video try karo
-                    try:
-                        await client.send_video(
-                            chat_id=message.chat.id,
-                            video=stream,
-                            caption=f"🎬 **{filename}**\n\n⚡ Powered by Proxy Magic",
-                            supports_streaming=True,
-                            progress=progress_bar,
-                            progress_args=(status, start_time, user_id)
-                        )
-                    except Exception:
-                        # Video fail to document bhejo
-                        await status.edit_text("📦 Sending as document...")
-                        
-                        # New stream chahiye
-                        async with SuperStream(session, direct_url, filename, headers, user_id, use_proxy=True) as stream2:
-                            await client.send_document(
-                                chat_id=message.chat.id,
-                                document=stream2,
-                                caption=f"📁 **{filename}**",
-                                progress=progress_bar,
-                                progress_args=(status, start_time, user_id)
-                            )
+                await stream.initialize()
                 
+                if stop_dict.get(user_id):
+                    stream.close()
+                    await status.edit_text("❌ Cancelled")
+                    return
+                
+                connection_type = "🌐 Proxy" if stream.using_proxy else "🔗 Direct"
+                await status.edit_text(f"{connection_type} **connected!**\n📤 Uploading...")
+                
+                # Try video upload
+                try:
+                    await client.send_video(
+                        chat_id=message.chat.id,
+                        video=stream,
+                        caption=f"🎬 **{filename}**\n\n{connection_type} connection",
+                        supports_streaming=True,
+                        progress=progress_bar,
+                        progress_args=(status, start_time, user_id)
+                    )
+                    
+                except Exception as vid_err:
+                    # Fallback to document
+                    stream.close()
+                    
+                    await status.edit_text("📦 Sending as document...")
+                    
+                    # Create new stream for document
+                    stream2 = ProxyStream(session, direct_url, filename, headers, user_id)
+                    await stream2.initialize()
+                    
+                    await client.send_document(
+                        chat_id=message.chat.id,
+                        document=stream2,
+                        caption=f"📁 **{filename}**",
+                        progress=progress_bar,
+                        progress_args=(status, start_time, user_id)
+                    )
+                    
+                    stream2.close()
+                
+                stream.close()
                 await status.delete()
-                await message.reply_text("✅ **Upload successful!** 🎉")
+                await message.reply_text("✅ **Done!** 🎉")
                 
-            except Exception as proxy_error:
-                # Proxy fail, direct try karo
-                await status.edit_text("⚠️ Proxy failed, trying direct connection...")
-                
-                async with SuperStream(session, direct_url, filename, headers, user_id, use_proxy=False) as stream:
-                    
-                    try:
-                        await client.send_video(
-                            chat_id=message.chat.id,
-                            video=stream,
-                            caption=f"🎬 **{filename}**",
-                            supports_streaming=True,
-                            progress=progress_bar,
-                            progress_args=(status, start_time, user_id)
-                        )
-                    except Exception:
-                        async with SuperStream(session, direct_url, filename, headers, user_id, use_proxy=False) as stream2:
-                            await client.send_document(
-                                chat_id=message.chat.id,
-                                document=stream2,
-                                caption=f"📁 **{filename}**",
-                                progress=progress_bar,
-                                progress_args=(status, start_time, user_id)
-                            )
-                
-                await status.delete()
-                await message.reply_text("✅ **Upload successful!** 🎉")
+            except Exception as stream_err:
+                stream.close()
+                raise stream_err
         
         stop_dict[user_id] = False
 
@@ -375,22 +376,27 @@ async def process_single_link(client: Client, message: Message, terabox_url: str
         error = str(e)
         
         if "cancel" in error.lower():
-            await status.edit_text("🛑 **Upload cancelled by user**")
-        elif "timeout" in error.lower() or "blocked" in error.lower():
+            await status.edit_text("🛑 **Cancelled**")
+        elif "timeout" in error.lower():
             await status.edit_text(
-                "⚠️ **Connection failed!**\n\n"
+                "⏱ **Timeout!**\n\n"
                 "**Tried:**\n"
-                "✓ Multiple proxy services\n"
-                "✓ Direct connection\n"
-                "✓ Different user agents\n\n"
-                "**Suggestions:**\n"
-                "• Try again in 10 minutes\n"
-                "• Check if cookie is valid\n"
-                "• Try different link\n"
-                "• File might be too large"
+                "• Proxy servers\n"
+                "• Direct connection\n\n"
+                "**Try:**\n"
+                "• Smaller file\n"
+                "• Wait 10 mins\n"
+                "• Check cookie"
+            )
+        elif "connection" in error.lower():
+            await status.edit_text(
+                "🔌 **Connection failed!**\n\n"
+                "• Terabox blocking requests\n"
+                "• All proxies failed\n"
+                "• Try again later"
             )
         else:
-            await status.edit_text(f"❌ **Error:**\n`{error[:300]}`")
+            await status.edit_text(f"❌ **Error:**\n```{error[:250]}```")
         
         stop_dict[user_id] = False
 
@@ -398,17 +404,16 @@ async def process_single_link(client: Client, message: Message, terabox_url: str
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
     await message.reply_text(
-        "🚀 **Advanced Terabox Downloader**\n\n"
-        "💡 **Features:**\n"
-        "• Automatic proxy rotation\n"
-        "• Direct connection fallback\n"
-        "• Smart retry mechanism\n"
-        "• IP block bypass\n\n"
-        "📤 Just send me any Terabox link!\n\n"
+        "🚀 **Terabox Downloader Pro**\n\n"
+        "✨ **Features:**\n"
+        "• Multi-proxy routing\n"
+        "• Auto fallback system\n"
+        "• IP block bypass\n"
+        "• Smart retry logic\n\n"
+        "📤 **Just send Terabox link!**\n\n"
         "**Commands:**\n"
-        "/start - Show this message\n"
-        "/stop - Cancel current download\n\n"
-        "**Supported:** terabox, 1024tera, momerybox, teraboxapp"
+        "/start - Info\n"
+        "/stop - Cancel download"
     )
 
 @app.on_message(filters.command("stop"))
@@ -428,7 +433,7 @@ async def handle_message(client, message):
     if tera_urls:
         user_id = message.from_user.id
         if user_id in stop_dict and not stop_dict[user_id]:
-            await message.reply_text("⚠️ **You already have an active download!**\nWait for it to finish or /stop it.")
+            await message.reply_text("⚠️ **Already downloading!**\nWait or /stop first.")
             return
             
         await process_single_link(client, message, tera_urls[0])
@@ -436,5 +441,5 @@ async def handle_message(client, message):
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
     loop.create_task(web_server())
-    print("🚀 Bot started with proxy magic!")
+    print("🚀 Bot online with proxy magic!")
     app.run()
