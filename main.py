@@ -2,6 +2,7 @@ import os
 import re
 import time
 import math
+import io
 import aiohttp
 import asyncio
 from aiohttp import web
@@ -62,9 +63,9 @@ async def progress_bar(current, total, message, start_time):
     now = time.time()
     diff = now - start_time
     
-    if diff < 1: return # Too fast update handling
+    if diff < 1: return 
 
-    if current % (total // 15) == 0 or current == total: # Update every ~5-10%
+    if current % (total // 15) == 0 or current == total:
         percentage = current * 100 / total
         speed = current / diff
         elapsed_time = round(diff) * 1000
@@ -87,14 +88,12 @@ async def progress_bar(current, total, message, start_time):
         )
         
         try:
-            await message.edit_text(
-                text=f"{tmp}",
-            )
+            await message.edit_text(text=f"{tmp}")
         except:
             pass
 
-# --- Streaming Class ---
-class URLFile:
+# --- Streaming Class (FIXED FOR BINARY ERROR) ---
+class URLFile(io.BytesIO): # Inherit BytesIO to pass Pyrogram checks
     def __init__(self, session, url, total_size, filename, headers, start_byte=0):
         self.session = session
         self.url = url
@@ -105,6 +104,7 @@ class URLFile:
         self.start_byte = start_byte
         self.current_byte = 0
         self.response = None
+        self.mode = 'rb' # <--- IMPORTANT: Tells Pyrogram this is Binary Data
 
     async def __aenter__(self):
         req_headers = self.headers.copy()
@@ -147,19 +147,12 @@ async def get_direct_link(terabox_url):
         if not TERABOX_COOKIE:
             return None, "Error: TERABOX_COOKIE missing."
 
-        # 1. URL Cleaning (Important for 1024tera etc)
-        # Koi bhi domain ho, usko 'www.terabox.com' bana do
         clean_url = re.sub(r"https?://[a-zA-Z0-9.-]+", "https://www.terabox.com", terabox_url)
-        print(f"Original: {terabox_url} -> Clean: {clean_url}") # Logs me dikhega
-
-        client = TeraboxDL(TERABOX_COOKIE)
         
+        client = TeraboxDL(TERABOX_COOKIE)
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: client.get_file_info(clean_url))
         
-        # Debugging ke liye Result print kar rahe hain (Render Logs check karna agar fail ho)
-        print(f"API Result: {result}") 
-
         if not result:
              return None, "Failed. Link dead or Cookie expired."
 
@@ -170,7 +163,7 @@ async def get_direct_link(terabox_url):
             file_info = result
 
         if not file_info:
-            return None, "No file info found in response."
+            return None, "No file info found."
 
         direct_link = file_info.get('dlink') or file_info.get('download_link') or file_info.get('url')
 
@@ -244,29 +237,18 @@ async def process_single_link(client, message, terabox_url):
     except Exception as e:
         await status_msg.edit_text(f"⚠️ Error: {e}")
 
-# --- START COMMAND ---
+# --- HANDLERS ---
 @app.on_message(filters.command("start"))
 async def start_handler(client, message):
     await message.reply_text(
-        "👋 **Hello! Welcome to Terabox Downloader Bot.**\n\n"
-        "Main aapki Terabox files ko direct Telegram par stream kar sakta hu.\n\n"
-        "📝 **Kaise use karein?**\n"
-        "Bas Terabox ka koi bhi link mujhe bhejein.\n"
-        "Example: `https://terabox.com/s/1abc...`\n\n"
-        "🚀 **Features:**\n"
-        "- Fast Streaming\n"
-        "- 1024tera/TeraboxApp supported\n"
-        "- Live Progress Bar (Speed + ETA)\n\n"
-        "👇 **Link Bhejo!**"
+        "👋 **Hello! Welcome to Terabox Downloader Bot.**\n"
+        "Link bhejo, video milegi!"
     )
 
-# --- TEXT HANDLER ---
 @app.on_message(filters.text & filters.regex(r"terabox|1024tera|momerybox|teraboxapp"))
 async def handle_message(client, message):
     text = message.text
     urls = re.findall(r'(https?://[^\s]+)', text)
-    
-    # Filter only terabox related links
     tera_urls = [url for url in urls if any(x in url for x in ['terabox', '1024tera', 'momerybox', 'teraboxapp'])]
     
     if not tera_urls:
